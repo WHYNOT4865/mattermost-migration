@@ -1,0 +1,130 @@
+name: Idempotent Mattermost Migration & Upgrade
+
+on:
+  push:
+    branches: [ "migration" ]
+  workflow_dispatch:
+
+env:
+  COMPOSE_FILE: docker-compose.prod.yml
+  LEGACY_IMAGE: mattermost/mattermost-team-edition:9.5.0
+  DB_MYSQL_ROOT_PASSWORD: ${{ secrets.DB_MYSQL_ROOT_PASSWORD }}
+  DB_POSTGRES_PASSWORD: ${{ secrets.DB_POSTGRES_PASSWORD }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  migrate-and-deploy:
+    runs-on: self-hosted
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Check migration status
+        id: check_status
+        run: |
+          if [ -f "$HOME/.mattermost_migration_completed" ]; then
+            echo "Database already migrated to PostgreSQL, skipping data transfer"
+            echo "already_migrated=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Migration required"
+            echo "already_migrated=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Stop legacy Mattermost
+        if: steps.check_status.outputs.already_migrated == 'false'
+        run: |
+          # чтобы во время бэкапа и переноса никто не писал в базу
+          docker stop mattermost || true
+
+      - name: Backup legacy MySQL
+        if: steps.check_status.outputs.already_migrated == 'false'
+        run: |
+          set -euo pipefail
+          if ! docker ps --format '{{.Names}}' | grep -qx mattermost-mysql; then
+            echo "Legacy MySQL container is not running"
+            exit 1
+          fi
+          mkdir -p "$HOME/mattermost_backups"
+          BACKUP_FILE="$HOME/mattermost_backups/mattermost_mysql_${{ github.run_id }}.sql"
+          # пароль через переменную окружения, а не через -p, чтобы не светился в списке процессов
+          docker exec -e MYSQL_PWD="$DB_MYSQL_ROOT_PASSWORD" mattermost-mysql \
+            mysqldump -uroot --single-transaction --routines mattermost > "$BACKUP_FILE"
+          echo "Backup saved: $BACKUP_FILE ($(du -h "$BACKUP_FILE" | cut -f1))"
+
+      - name: Start target PostgreSQL
+        if: steps.check_status.outputs.already_migrated == 'false'
+        run: docker compose -f $COMPOSE_FILE up -d --wait db-postgres
+
+      - name: Prepare PostgreSQL schema
+        if: steps.check_status.outputs.already_migrated == 'false'
+        run: |
+          set -euo pipefail
+          # Сносим всё, что могло остаться от упавшего прошлого запуска (аналог include drop),
+          # и создаем чистую схему той же версии, что и в MySQL (9.5).
+          # Схему создает сам Mattermost: pgloader не умеет enum/jsonb, которые ему нужны.
+          docker exec mattermost-postgres psql -U postgres -d mattermost -q -v ON_ERROR_STOP=1 \
+            -c "DROP SCHEMA IF EXISTS mattermost CASCADE" \
+            -c "DROP SCHEMA IF EXISTS public CASCADE" \
+            -c "CREATE SCHEMA public"
+          docker run --rm --network=mattermost_network \
+            -e MM_SQLSETTINGS_DRIVERNAME=postgres \
+            -e MM_SQLSETTINGS_DATASOURCE="postgres://postgres:$DB_POSTGRES_PASSWORD@mattermost-postgres:5432/mattermost?sslmode=disable" \
+            $LEGACY_IMAGE mattermost db migrate > /dev/null
+          echo "Schema created"
+
+      - name: Run pgloader
+        if: steps.check_status.outputs.already_migrated == 'false'
+        run: |
+          set -euo pipefail
+          LOAD_FILE="$RUNNER_TEMP/migration.load"
+          sed -e "s|__MYSQL_PASSWORD__|$DB_MYSQL_ROOT_PASSWORD|" \
+              -e "s|__POSTGRES_PASSWORD__|$DB_POSTGRES_PASSWORD|" \
+              migration.load > "$LOAD_FILE"
+          docker run --rm --network=mattermost_network \
+            -v "$LOAD_FILE:/migration.load:ro" \
+            mattermost/mattermost-pgloader:latest pgloader /migration.load 2>&1 | tee "$RUNNER_TEMP/pgloader.log"
+          rm -f "$LOAD_FILE"
+          # pgloader возвращает 0 даже если не смог подключиться, поэтому смотрим лог
+          if grep -qE ' (ERROR|FATAL) ' "$RUNNER_TEMP/pgloader.log"; then
+            echo "pgloader finished with errors"
+            exit 1
+          fi
+
+      - name: Compare row counts
+        if: steps.check_status.outputs.already_migrated == 'false'
+        run: |
+          set -euo pipefail
+          for table in Users Teams Channels Posts; do
+            src=$(docker exec -e MYSQL_PWD="$DB_MYSQL_ROOT_PASSWORD" mattermost-mysql \
+              mysql -uroot -N -e "SELECT COUNT(*) FROM $table" mattermost)
+            dst=$(docker exec mattermost-postgres \
+              psql -U postgres -d mattermost -tA -c "SELECT COUNT(*) FROM public.$(echo $table | tr A-Z a-z)")
+            echo "$table: mysql=$src postgres=$dst"
+            [ "$src" = "$dst" ] || { echo "Row count mismatch in $table"; exit 1; }
+          done
+
+      - name: Mark migration as completed
+        if: steps.check_status.outputs.already_migrated == 'false'
+        run: touch "$HOME/.mattermost_migration_completed"
+
+      - name: Deploy upgraded stack
+        run: |
+          # --remove-orphans убирает контейнер mysql, оставшийся от legacy (у обоих compose один project name)
+          docker compose -f $COMPOSE_FILE up -d --remove-orphans
+
+      - name: Health check
+        run: |
+          for i in $(seq 1 60); do
+            if curl -fsS http://localhost:8065/api/v4/system/ping; then
+              echo
+              echo "Mattermost is up and running on PostgreSQL"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "Health check failed"
+          docker compose -f $COMPOSE_FILE logs --tail 100 mattermost
+          exit 1

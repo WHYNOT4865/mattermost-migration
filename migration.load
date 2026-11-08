@@ -1,0 +1,44 @@
+LOAD DATABASE
+    FROM mysql://root:__MYSQL_PASSWORD__@mattermost-mysql:3306/mattermost
+    INTO pgsql://postgres:__POSTGRES_PASSWORD__@mattermost-postgres:5432/mattermost
+
+WITH data only,
+    workers = 8, concurrency = 1,
+    multiple readers per thread, rows per range = 10000,
+    prefetch rows = 10000, batch rows = 2500,
+    create no tables, create no indexes,
+    preserve index names
+
+SET PostgreSQL PARAMETERS
+    maintenance_work_mem to '128MB',
+    work_mem to '12MB'
+
+SET MySQL PARAMETERS
+    net_read_timeout = '120',
+    net_write_timeout = '120'
+
+CAST column Channels.Type to "channel_type" drop typemod,
+    column Teams.Type to "team_type" drop typemod,
+    column UploadSessions.Type to "upload_session_type" drop typemod,
+    column ChannelBookmarks.Type to "channel_bookmark_type" drop typemod,
+    column Drafts.Priority to text,
+    type int when (= precision 11) to integer drop typemod,
+    type bigint when (= precision 20) to bigint drop typemod,
+    type text to varchar drop typemod using remove-null-characters,
+    type tinyint when (<= precision 4) to boolean using tinyint-to-boolean,
+    type json to jsonb drop typemod using remove-null-characters
+
+EXCLUDING TABLE NAMES MATCHING ~<IR_>, ~<focalboard>, ~<calls>, 'schema_migrations', 'db_migrations', 'db_lock',
+    'configurations', 'configurationfiles', 'db_config_migrations'
+
+BEFORE LOAD DO
+    $$ ALTER SCHEMA public RENAME TO mattermost; $$,
+    $$ TRUNCATE TABLE mattermost.systems; $$,
+    $$ DROP INDEX IF EXISTS mattermost.idx_posts_message_txt; $$,
+    $$ DROP INDEX IF EXISTS mattermost.idx_fileinfo_content_txt; $$
+
+AFTER LOAD DO
+    $$ UPDATE mattermost.db_migrations SET name = 'add_createat_to_teamembers' WHERE version = 92; $$,
+    $$ ALTER SCHEMA mattermost RENAME TO public; $$,
+    $$ SELECT pg_catalog.set_config('search_path', '"$user", public', false); $$,
+    $$ ALTER USER postgres SET search_path TO "$user", public; $$;

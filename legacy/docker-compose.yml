@@ -1,0 +1,54 @@
+name: mattermost
+
+services:
+  mattermost:
+    image: mattermost/mattermost-team-edition:9.5.0
+    container_name: mattermost
+    ports:
+      - "8065:8065"
+    environment:
+      - MM_SQLSETTINGS_DRIVERNAME=mysql
+      - MM_SQLSETTINGS_DATASOURCE=root:${DB_MYSQL_ROOT_PASSWORD}@tcp(mattermost-mysql:3306)/mattermost?charset=utf8mb4,utf8&writeTimeout=30s
+      - MM_SERVICESETTINGS_SITEURL=http://localhost:8065
+      - MM_TEAMSETTINGS_ENABLEOPENSERVER=false
+    volumes:
+      - mattermost_data:/mattermost/data
+      - mattermost_logs:/mattermost/logs
+    networks:
+      - mattermost_network
+    depends_on:
+      mattermost-mysql:
+        condition: service_healthy
+    restart: unless-stopped
+
+  mattermost-mysql:
+    image: mysql:8.0
+    container_name: mattermost-mysql
+    environment:
+      - MYSQL_ROOT_PASSWORD=${DB_MYSQL_ROOT_PASSWORD}
+      - MYSQL_DATABASE=mattermost
+      - TZ=UTC
+    command: ["--character-set-server=utf8mb4", "--collation-server=utf8mb4_general_ci"]
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    volumes:
+      - mysql_data:/var/lib/mysql
+    networks:
+      - mattermost_network
+    restart: unless-stopped
+
+networks:
+  mattermost_network:
+    name: mattermost_network
+    driver: bridge
+
+volumes:
+  mattermost_data:
+    name: mattermost_data
+  mattermost_logs:
+    name: mattermost_logs
+  mysql_data:
+    name: mattermost_mysql_data
