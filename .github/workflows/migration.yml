@@ -128,3 +128,19 @@ jobs:
           echo "Health check failed"
           docker compose -f $COMPOSE_FILE logs --tail 100 mattermost
           exit 1
+
+      - name: Show Mattermost version
+        run: curl -fsS -D - -o /dev/null http://localhost:8065/api/v4/system/ping | grep -i '^x-version-id'
+
+      - name: Collect latest backup
+        run: |
+          mkdir -p backup
+          cp "$(ls -t $HOME/mattermost_backups/*.sql | head -1)" backup/
+          ls -la backup
+
+      - name: Upload backup as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mysql-backup
+          path: backup/
+          retention-days: 7
